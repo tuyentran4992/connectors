@@ -18,6 +18,8 @@ added here:
    next-URL paginator covers.
 """
 
+from datetime import datetime, timezone
+from importlib import resources
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -25,10 +27,18 @@ from typing import Any
 import requests
 from connectors_sdk import ApiClientError, BaseClientApi
 from connectors_sdk.connectors.external_import.logger import ConnectorLogger
+from wiz_client.models import WizIssue, WizVulnerabilityFinding
 
 
 class WizGraphQLError(ApiClientError):
     """Raised on an HTTP 200 response carrying a populated GraphQL errors array."""
+
+
+def _utc(dt: datetime) -> str:
+    # Full precision matters: Wiz createdAt carries microseconds and the
+    # filter is exclusive, so truncating to the second would re-select the
+    # issue the cursor points at on every run.
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class WizApiClient(BaseClientApi):
@@ -91,7 +101,7 @@ class WizApiClient(BaseClientApi):
 
     # -- GraphQL ------------------------------------------------------------
 
-    def execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    def _execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         """Run a single GraphQL query.
 
         Args:
@@ -113,7 +123,7 @@ class WizApiClient(BaseClientApi):
             raise WizGraphQLError("Wiz GraphQL response has no data")
         return data
 
-    def paginate(
+    def _paginate(
         self,
         query: str,
         variables: dict[str, Any],
@@ -136,7 +146,7 @@ class WizApiClient(BaseClientApi):
         variables = dict(variables)
         previous_cursor: str | None = None
         while True:
-            connection = self.execute(query, variables)[connection_key]
+            connection = self._execute(query, variables)[connection_key]
             nodes = connection.get("nodes") or []
             if nodes:
                 yield nodes
@@ -160,3 +170,73 @@ class WizApiClient(BaseClientApi):
                 return
             previous_cursor = cursor
             variables["after"] = cursor
+
+    def paginate_issues(
+        self,
+        first: int | None = None,
+        after: str | None = None,
+        severity: list[str] | None = None,
+        status: list[str] | None = None,
+        created_after: datetime | None = None,
+    ) -> Iterator[list[WizIssue]]:
+        issues_query = (
+            resources.files("wiz_cloud.queries")
+            .joinpath("issues.graphql")
+            .read_text("utf-8")
+        )
+
+        pages = self._paginate(
+            query=issues_query,
+            variables={
+                "first": first,
+                "after": after,
+                # Oldest first: incidents then reach the platform in the order
+                # they happened, and a run that dies halfway leaves a contiguous
+                # window behind. See state.py for why the cursor stays safe.
+                "orderBy": {"field": "CREATED_AT", "direction": "ASC"},
+                "filterBy": {
+                    "type": ["THREAT_DETECTION"],
+                    "severity": severity,
+                    "status": status,
+                    "createdAt": {"after": _utc(created_after)},
+                },
+            },
+            connection_key="issues",
+        )
+
+        for page in pages:
+            yield [WizIssue.model_validate(raw) for raw in page]
+
+    def paginate_vulnerabilities(
+        self,
+        first: int | None = None,
+        after: str | None = None,
+        severity: list[str] | None = None,
+        status: list[str] | None = None,
+        has_exploit: bool | None = None,
+        asset_id: str | None = None,
+    ) -> Iterator[list[WizVulnerabilityFinding]]:
+        vulnerabilities_query = (
+            resources.files("wiz_cloud.queries")
+            .joinpath("vulnerability_findings.graphql")
+            .read_text("utf-8")
+        )
+
+        pages = self._paginate(
+            query=vulnerabilities_query,
+            variables={
+                "first": first,
+                "after": after,
+                "orderBy": {"field": "CREATED_AT", "direction": "DESC"},
+                "filterBy": {
+                    "assetIdV2": {"equals": [asset_id]},
+                    "severity": severity,
+                    "status": status,
+                    "hasExploit": has_exploit,
+                },
+            },
+            connection_key="vulnerabilityFindings",
+        )
+
+        for page in pages:
+            yield [WizVulnerabilityFinding.model_validate(raw) for raw in page]
