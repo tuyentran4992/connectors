@@ -7,11 +7,10 @@ is converted and travel in the same bundle, so an issue and its
 vulnerabilities are never committed apart.
 """
 
+from __future__ import annotations
 from collections.abc import Iterator
 from datetime import datetime, timezone
-from importlib import resources
-
-from connectors_sdk import BaseDataProcessor
+from typing import TYPE_CHECKING
 from connectors_sdk.models import (
     ExternalReference,
     Incident,
@@ -21,15 +20,20 @@ from connectors_sdk.models import (
     TLPMarking,
     Vulnerability,
 )
-from connectors_sdk.models.enums import IncidentSeverity, IncidentType, RelationshipType
-from pydantic import ValidationError
-from wiz_cloud.client_api import WizApiClient
-from wiz_cloud.models import WizEntitySnapshot, WizIssue
-from wiz_cloud.processors.vulnerabilities_processor import WizVulnerabilitiesProcessor
-
-ISSUES_QUERY = (
-    resources.files("wiz_cloud.queries").joinpath("issues.graphql").read_text("utf-8")
+from connectors_sdk import BaseDataProcessor
+from connectors_sdk.models.enums import (
+    CvssSeverity,
+    IncidentSeverity,
+    IncidentType,
+    RelationshipType,
 )
+from wiz_client.client_api import WizApiClient
+from wiz_client.models import WizEntitySnapshot, WizIssue
+
+if TYPE_CHECKING:
+    from wiz_client.models import WizIssue, WizVulnerabilityFinding
+    from wiz_cloud.settings import ConnectorSettings
+    from wiz_cloud.state import WizConnectorState
 
 # Wiz Severity enum to SDK IncidentSeverity. INFORMATIONAL has no OpenCTI
 # equivalent and maps to LOW.
@@ -42,19 +46,9 @@ _SEVERITY = {
 }
 
 
-def _utc(dt: datetime) -> str:
-    # Full precision matters: Wiz createdAt carries microseconds and the
-    # filter is exclusive, so truncating to the second would re-select the
-    # issue the cursor points at on every run.
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 class WizIssuesProcessor(BaseDataProcessor):
-    # Set in post_init() when vulnerability import is enabled. Declared here
-    # so conversion works on a processor whose post_init() was skipped.
-    _vulnerabilities: WizVulnerabilitiesProcessor | None = None
-
-    # -- lifecycle -----------------------------------------------------------
+    settings: ConnectorSettings
+    state: WizConnectorState
 
     def post_init(self) -> None:
         """Build the Wiz client and the objects shared by every bundle.
@@ -73,23 +67,44 @@ class WizIssuesProcessor(BaseDataProcessor):
             max_retries=3,
             backoff_factor=2.0,
         )
+
         self._author = OrganizationAuthor(name="Wiz")
         self._marking = TLPMarking(level=self._config.marking)
-        # Built here rather than in __init__ because it needs the settings and
-        # shares the client, so both queries ride on a single access token.
-        self._vulnerabilities: WizVulnerabilitiesProcessor | None = None
-        if self._config.import_vulnerabilities:
-            self._vulnerabilities = WizVulnerabilitiesProcessor(
-                client=self._client,
-                config=self._config,
-                logger=self.logger,
-                author=self._author,
-                marking=self._marking,
-            )
 
-    # -- collect -------------------------------------------------------------
+        self._issue_converter = IssueConverter(
+            author=self._author,
+            marking=self._marking,
+        )
+        self._vulnerability_converter = VulnerabilityConverter(
+            author=self._author,
+            marking=self._marking,
+        )
 
-    def collect(self) -> Iterator[list[dict]]:
+    def _paginate_issues(self, since: datetime) -> Iterator[list[WizIssue]]:
+        return self._client.paginate_issues(
+            first=self._config.page_size,
+            after=None,
+            severity=self._config.issue_severity,
+            status=self._config.issue_status,
+            created_after=since,
+        )
+
+    def _paginate_vulnerabilities(
+        self, issue: WizIssue
+    ) -> Iterator[list[WizVulnerabilityFinding]]:
+        if not issue.entity_snapshot:
+            return iter([])
+
+        return self._client.paginate_vulnerabilities(
+            first=self._config.page_size,
+            after=None,
+            severity=self._config.vulnerability_severity,
+            status=self._config.vulnerability_status,
+            has_exploit=self._config.vulnerability_has_exploit,
+            asset_id=issue.entity_snapshot.id,
+        )
+
+    def collect(self) -> Iterator[list[WizIssue]]:
         """Fetch Threat Detection issues created since the last run.
 
         The lower bound is the stored cursor, or now minus the configured
@@ -101,7 +116,9 @@ class WizIssuesProcessor(BaseDataProcessor):
         since = self.state.issues_last_created_at or (
             datetime.now(tz=timezone.utc) - self._config.since
         )
+
         self.work_name = f"Wiz Cloud issues import since {since:%Y-%m-%d %H:%M}"
+
         self.logger.info(
             "[WIZ-CLOUD] Collecting issues",
             {
@@ -111,25 +128,22 @@ class WizIssuesProcessor(BaseDataProcessor):
             },
         )
 
-        variables = {
-            "first": self._config.page_size,
-            "after": None,
-            # Oldest first: incidents then reach the platform in the order
-            # they happened, and a run that dies halfway leaves a contiguous
-            # window behind. See state.py for why the cursor stays safe.
-            "orderBy": {"field": "CREATED_AT", "direction": "ASC"},
-            "filterBy": {
-                "type": ["THREAT_DETECTION"],
-                "severity": list(self._config.issue_severity),
-                "status": list(self._config.issue_status),
-                "createdAt": {"after": _utc(since)},
-            },
-        }
-        yield from self._client.paginate(
-            ISSUES_QUERY, variables, connection_key="issues"
-        )
+        for issues_page in self._paginate_issues(since=since):
+            results = []
 
-    # -- transform -----------------------------------------------------------
+            for issue in issues_page:
+                result = {"issue": issue, "vulnerabilities": []}
+
+                if self._config.import_vulnerabilities:
+                    for issue in issues_page:
+                        if issue.entity_snapshot:
+                            for vulnerabilities_page in self._paginate_vulnerabilities(
+                                issue=issue
+                            ):
+                                result["vulnerabilities"].extend(vulnerabilities_page)
+                results.append(result)
+
+            yield results
 
     def transform(self, data: Iterator[list[dict]]) -> Iterator[list]:
         """Convert raw issue pages into bundle objects.
@@ -151,45 +165,46 @@ class WizIssuesProcessor(BaseDataProcessor):
         # Run-scoped caches: the same entitySnapshot backs many issues, and
         # author/marking must be sent once, not once per page.
         systems_cache: dict[str, System] = {}
+        issues_converted = 0
+        vulnerabilities_converted = 0
+        bundles_sent = 0
         shared_sent = False
         max_created = self.state.issues_last_created_at
-        issues_converted = 0
-        bundles_sent = 0
-        vulnerabilities_sent = 0
 
-        for page in data:
+        for results in data:
             page_objects: list = []
 
-            for raw in page:
-                try:
-                    issue = WizIssue.model_validate(raw)
-                except ValidationError as err:
-                    self.logger.warning(
-                        "[WIZ-CLOUD] Skipping unparseable issue",
-                        {"id": raw.get("id"), "error": str(err)},
-                    )
-                    continue
+            for result in results:
+                issue = result["issue"]
 
-                objects = self._convert(issue, systems_cache)
+                issue_objects = self._issue_converter.convert_issue(
+                    issue, systems_cache
+                )
+                page_objects.extend(issue_objects)
                 issues_converted += 1
+
                 if max_created is None or issue.created_at > max_created:
                     max_created = issue.created_at
 
-                if self._vulnerabilities is None:
-                    page_objects.extend(objects)
-                    continue
+                if self._config.import_vulnerabilities:
+                    vulnerabilities = result["vulnerabilities"]
 
-                vulnerabilities = 0
-                if issue.entity_snapshot is not None:
-                    found = self._vulnerabilities.objects_for_asset(
-                        issue.entity_snapshot.id,
-                        systems_cache[issue.entity_snapshot.id],
-                    )
-                    vulnerabilities = sum(
-                        1 for obj in found if isinstance(obj, Vulnerability)
-                    )
-                    objects.extend(found)
-                vulnerabilities_sent += vulnerabilities
+                    for vulnerability in vulnerabilities:
+                        if not vulnerability.name:
+                            self.logger.warning(
+                                "[WIZ-CLOUD] Skipping finding without a CVE id",
+                                {"id": vulnerability.id},
+                            )
+                            continue
+
+                        vulnerability_objects = (
+                            self._vulnerability_converter.convert_vulnerability(
+                                issue.entity_snapshot.id,
+                                systems_cache[issue.entity_snapshot.id],
+                            )
+                        )
+                        page_objects.extend(vulnerability_objects)
+                        vulnerabilities_converted += 1
 
                 self.logger.info(
                     "[WIZ-CLOUD] Sending an incident with its vulnerabilities",
@@ -205,9 +220,6 @@ class WizIssuesProcessor(BaseDataProcessor):
                         "vulnerabilities": vulnerabilities,
                     },
                 )
-                yield self._with_shared(objects, shared_sent)
-                shared_sent = True
-                bundles_sent += 1
 
             if page_objects:
                 yield self._with_shared(page_objects, shared_sent)
@@ -218,7 +230,7 @@ class WizIssuesProcessor(BaseDataProcessor):
             self.logger.info(
                 "[WIZ-CLOUD] Nothing to ingest, no new issue since the last run",
                 (
-                    {"since": _utc(self.state.issues_last_created_at)}
+                    {"since": self.state.issues_last_created_at}
                     if self.state.issues_last_created_at
                     else {}
                 ),
@@ -228,7 +240,7 @@ class WizIssuesProcessor(BaseDataProcessor):
                 "[WIZ-CLOUD] Import finished",
                 {
                     "incidents": issues_converted,
-                    "vulnerabilities": vulnerabilities_sent,
+                    "vulnerabilities": vulnerabilities_converted,
                     "bundles": bundles_sent,
                 },
             )
@@ -267,20 +279,25 @@ class WizIssuesProcessor(BaseDataProcessor):
         if max_created is None:
             return
 
-        failures = self._vulnerabilities.failures if self._vulnerabilities else 0
-        if failures:
-            self.logger.warning(
-                "[WIZ-CLOUD] Holding the issues cursor back after vulnerability "
-                "failures, the window will be imported again on the next run",
-                {"failed_assets": failures},
-            )
-            return
+        # ! Disagree -> should be fatal for the same reason not beeing able to fecth issues should be fatal
+        # failures = self._vulnerabilities.failures if self._vulnerabilities else 0
+        # if failures:
+        #     self.logger.warning(
+        #         "[WIZ-CLOUD] Holding the issues cursor back after vulnerability "
+        #         "failures, the window will be imported again on the next run",
+        #         {"failed_assets": failures},
+        #     )
+        #     return
 
         self.state.issues_last_created_at = max_created
 
-    # -- conversion ----------------------------------------------------------
 
-    def _convert(self, issue: WizIssue, systems_cache: dict[str, System]) -> list:
+class IssueConverter:
+    def __init__(self, author: OrganizationAuthor, marking: TLPMarking) -> None:
+        self._author = author
+        self._marking = marking
+
+    def convert_issue(self, issue: WizIssue, systems_cache: dict[str, System]) -> list:
         """Convert one Wiz issue into its bundle objects.
 
         Args:
@@ -398,3 +415,160 @@ class WizIssuesProcessor(BaseDataProcessor):
         )
         cache[snapshot.id] = system
         return system, True
+
+
+class VulnerabilityConverter:
+    def __init__(self, author: OrganizationAuthor, marking: TLPMarking) -> None:
+        self._author = author
+        self._marking = marking
+
+    def convert_vulnerability(
+        self, finding: WizVulnerabilityFinding, system: System
+    ) -> list:
+        """Convert one finding into its bundle objects.
+
+        Args:
+            finding: Parsed Wiz vulnerability finding.
+            system: The System carrying the vulnerability.
+
+        Returns:
+            The Vulnerability and its has Relationship, or an empty list when
+            the finding carries no CVE id and so cannot be keyed.
+        """
+        vulnerability = self._vulnerability(finding)
+        return [
+            vulnerability,
+            Relationship(
+                type=RelationshipType.HAS,
+                source=system,
+                target=vulnerability,
+                description=(
+                    f"Wiz finding {finding.id}, "
+                    f"severity {finding.severity}, status {finding.status}"
+                ),
+                start_time=finding.first_detected_at,
+                # stop_time is left unset on purpose: generate_id() hashes it,
+                # so lastDetectedAt would mint a new relationship every run.
+                author=self._author,
+                markings=[self._marking],
+            ),
+        ]
+
+    def _vulnerability(self, finding: WizVulnerabilityFinding) -> Vulnerability:
+        cvss_v2 = finding.cvss_v2
+        cvss_v3 = finding.cvss_v3
+        cvss_v4 = finding.cvss_v4
+        return Vulnerability(
+            # The OpenCTI id derives from the name alone, so it must be the
+            # CVE id.
+            name=finding.name,
+            # CVEDescription is the CVE text; description is finding-specific
+            # prose that would differ per asset and fight itself on merge.
+            description=finding.cve_description or finding.description or None,
+            # Wiz score is a CVSS base score, not the OpenCTI 0-100 score.
+            cvss_v3_base_score=finding.score,
+            cvss_v3_base_severity=self._cvss_severity(finding.cvss_severity),
+            cvss_v3_attack_vector=cvss_v3.attack_vector if cvss_v3 else None,
+            cvss_v3_attack_complexity=cvss_v3.attack_complexity if cvss_v3 else None,
+            cvss_v3_privileges_required=(
+                cvss_v3.privileges_required if cvss_v3 else None
+            ),
+            cvss_v3_user_interaction=(
+                self._user_interaction(cvss_v3.user_interaction_required)
+                if cvss_v3
+                else None
+            ),
+            cvss_v3_confidentiality_impact=(
+                cvss_v3.confidentiality_impact if cvss_v3 else None
+            ),
+            cvss_v3_integrity_impact=cvss_v3.integrity_impact if cvss_v3 else None,
+            cvss_v3_availability_impact=(
+                cvss_v3.availability_impact if cvss_v3 else None
+            ),
+            cvss_v3_scope=cvss_v3.scope if cvss_v3 else None,
+            cvss_v3_exploit_code_maturity=(
+                cvss_v3.exploit_code_maturity if cvss_v3 else None
+            ),
+            cvss_v2_access_vector=cvss_v2.attack_vector if cvss_v2 else None,
+            cvss_v2_access_complexity=cvss_v2.attack_complexity if cvss_v2 else None,
+            cvss_v2_confidentiality_impact=(
+                cvss_v2.confidentiality_impact if cvss_v2 else None
+            ),
+            cvss_v2_integrity_impact=cvss_v2.integrity_impact if cvss_v2 else None,
+            cvss_v2_availability_impact=(
+                cvss_v2.availability_impact if cvss_v2 else None
+            ),
+            cvss_v4_attack_vector=cvss_v4.attack_vector if cvss_v4 else None,
+            cvss_v4_attack_complexity=cvss_v4.attack_complexity if cvss_v4 else None,
+            cvss_v4_attack_requirements=(
+                cvss_v4.attack_requirements if cvss_v4 else None
+            ),
+            cvss_v4_privileges_required=(
+                cvss_v4.privileges_required if cvss_v4 else None
+            ),
+            cvss_v4_user_interaction=cvss_v4.user_interaction if cvss_v4 else None,
+            epss_score=self._ratio(finding.epss_probability),
+            epss_percentile=self._ratio(finding.epss_percentile),
+            is_cisa_kev=finding.has_cisa_kev_exploit,
+            external_references=self._finding_references(finding),
+            author=self._author,
+            markings=[self._marking],
+        )
+
+    def _ratio(self, percentage: float | None) -> float | None:
+        """Convert a Wiz percentage into the 0-1 ratio OpenCTI expects.
+
+        Args:
+            percentage: A percentage such as 72.4, or None.
+
+        Returns:
+            The value divided by 100, or None. Values outside 0-100 are dropped
+            rather than rejected by the model.
+        """
+        if percentage is None or not 0 <= percentage <= 100:
+            return None
+        return round(percentage / 100, 6)
+
+    def _user_interaction(self, required: bool | None) -> str | None:
+        """Convert the Wiz boolean into the CVSS user-interaction string.
+
+        Args:
+            required: Whether user interaction is required, or None.
+
+        Returns:
+            "REQUIRED", "NONE", or None when unknown.
+        """
+        if required is None:
+            return None
+        return "REQUIRED" if required else "NONE"
+
+    def _cvss_severity(self, severity: str | None) -> CvssSeverity | None:
+        """Convert a Wiz CVSS severity into the SDK enum.
+
+        Args:
+            severity: A Wiz severity such as "HIGH", or None.
+
+        Returns:
+            The matching CvssSeverity, or None when it is unknown.
+        """
+        if not severity:
+            return None
+        try:
+            return CvssSeverity(severity.upper())
+        except ValueError:
+            return None
+
+    def _finding_references(
+        self, finding: WizVulnerabilityFinding
+    ) -> list[ExternalReference]:
+        references = []
+        if finding.portal_url:
+            references.append(
+                ExternalReference(
+                    source_name="Wiz",
+                    url=finding.portal_url,  # taken from the API, never rebuilt
+                    external_id=finding.id,
+                    description="Wiz vulnerability finding",
+                )
+            )
+        return references
